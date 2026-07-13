@@ -840,6 +840,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
 
+		// Provider-scoped upstream usage (ChatGPT/Codex quota, etc.). The
+		// provider is identified by a stable, provider-namespaced ID returned
+		// by GET /v0/management/providers — never by authIndex or filename.
+		mgmt.GET("/providers", s.mgmt.GetProviders)
+		mgmt.GET("/providers/:providerId/usage", s.mgmt.GetProviderUsage)
+
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
 		mgmt.PATCH("/gemini-api-key", s.mgmt.PatchGeminiKey)
