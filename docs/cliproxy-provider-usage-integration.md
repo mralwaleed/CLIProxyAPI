@@ -23,7 +23,9 @@ Architecture:
 Claude Code Router provider
   → CLIProxyAPI GET /v0/management/providers/{providerId}/usage
     → matching OAuth credential (resolved by stable ID)
-      → upstream quota endpoint (chatgpt.com/backend-api/wham/usage)
+      → upstream quota endpoint, per provider family:
+          • Codex/ChatGPT: chatgpt.com/backend-api/wham/usage
+          • Claude/Anthropic: api.anthropic.com/api/oauth/{usage,profile}
         → normalized "meters" response
           → CCR account/usage widget
 ```
@@ -198,7 +200,7 @@ Non-200 responses use a single canonical error object:
 | 403 | `USAGE_UNAUTHORIZED` / `USAGE_CREDENTIAL_EXPIRED` | Credential unauthorized/revoked, or token expired |
 | 404 | `USAGE_PROVIDER_NOT_FOUND` | Provider ID does not match a credential |
 | 409 | `USAGE_CREDENTIAL_MISSING` | Provider resolved but no usable access token is attached |
-| 422 | `USAGE_UNSUPPORTED` | Usage is unsupported for this provider type (e.g. API-key, or non-codex OAuth) |
+| 422 | `USAGE_UNSUPPORTED` | Usage is unsupported for this provider type (e.g. API-key, or OAuth providers other than Codex/Claude) |
 | 429 | `USAGE_UPSTREAM_RATE_LIMITED` | Upstream rate limit |
 | 502 | `USAGE_UPSTREAM_FAILED` / `USAGE_UPSTREAM_MALFORMED` | Upstream quota call failed or response was malformed |
 | 503 | `USAGE_CREDENTIAL_INCOMPLETE` / `USAGE_CREDENTIAL_UNAVAILABLE` / `USAGE_INTERNAL` | Required credential metadata missing or fetch failed internally |
@@ -241,6 +243,41 @@ Implementation: `internal/providerusage/cache.go`, `service.go`.
   the canonical meters.
 - Never logs tokens or response bodies; logs only the provider ID and error code.
 
+### Claude / Anthropic adapter
+
+`internal/providerusage/claude.go`:
+
+- Resolves the OAuth `access_token` from credential metadata (same resolution
+  order as the management `$TOKEN$` substitution).
+- Calls the same endpoints the Claude Code CLI and the management quota UI use:
+  `https://api.anthropic.com/api/oauth/usage` (quota) and
+  `https://api.anthropic.com/api/oauth/profile` (account/plan, best-effort). The
+  usage URL is derived from the credential's `base_url` attribute when present.
+- Sends headers: `Authorization: Bearer <token>`, `Accept: application/json`,
+  `Content-Type: application/json`, `anthropic-beta: oauth-2025-04-20`.
+- Reuses the shared uTLS Chrome-fingerprint client
+  (`internal/runtime/executor/helps.NewUtlsHTTPClient`) — `api.anthropic.com` is
+  a uTLS-protected host and uses the same fingerprint the Claude auth package
+  uses for token refresh. The fetch timeout (20 s) is the documented intentional
+  exception to the project timeout rule (see `AGENTS.md`).
+- Normalizes rolling windows (`five_hour`, `seven_day`, `seven_day_oauth_apps`,
+  `seven_day_opus`, `seven_day_sonnet`, `seven_day_cowork`, `iguana_necktie`).
+  Each window carries a `utilization` **fraction** in `[0.0, 1.0]`, reported as
+  `used = utilization * 100` against a 100 limit (so utilization `0.0` ⇒ 0% used
+  / 100% remaining, and `0.25` ⇒ 25% used / 75% remaining).
+- Defensively normalizes a `limits` array when present (e.g. scoped weekly limits
+  per model such as Fable). Each limit exposes a `percent` **already on a 0-100
+  scale** — it is mapped directly to `used` and is **never multiplied**. The
+  upstream also echoes the rolling windows in this array, so each limit is
+  de-duplicated against the windows by (reset second, used, remaining); a
+  genuinely distinct scoped limit (different value) survives.
+- Preserves optional `extra_usage` (monthly credits meter when enabled) and the
+  plan label (`max` / `pro` / org rate-limit tier) from the profile in `message`.
+- An expired/revoked token is surfaced as `403 USAGE_UNAUTHORIZED` (an upstream
+  `401`), **not** as `usageSupported: false`; the listing keeps
+  `usageSupported: true` for valid-shape Claude OAuth credentials.
+- Never logs tokens or response bodies; logs only the provider ID and error code.
+
 ## 8. Security
 
 - No OAuth tokens, refresh tokens, account tokens, API keys, cookies, or full
@@ -274,8 +311,10 @@ ChatGPT services.** Tests redirect the upstream URL via the credential's
 - **404 for a known account**: the provider ID is derived from the persisted
   `account_id`; if a Codex credential has no `account_id` (e.g. API-key style),
   it is listed with `key_` shape, not `account_`.
-- **422 unsupported**: only OAuth Codex/ChatGPT accounts currently support
-  upstream usage. API-key accounts and other OAuth providers return 422.
+- **422 unsupported**: only OAuth Codex/ChatGPT and Claude/Anthropic accounts
+  support upstream usage. API-key accounts and other OAuth providers return 422.
+  An expired/revoked Claude token still lists as `usageSupported: true` and
+  surfaces the auth failure as `403 USAGE_UNAUTHORIZED` on fetch.
 - **502 malformed**: the upstream `wham/usage` shape changed; the parser in
   `codex.go` needs updating.
 - **503 incomplete**: the Codex credential exists but has no `account_id`

@@ -38,6 +38,7 @@ func NewService() *Service {
 		adapters: map[string]Adapter{},
 	}
 	s.RegisterAdapter("codex", codexAdapter{})
+	s.RegisterAdapter("claude", claudeAdapter{})
 	return s
 }
 

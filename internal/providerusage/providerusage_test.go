@@ -261,12 +261,14 @@ func TestUsage_UnsupportedAPIKey(t *testing.T) {
 }
 
 func TestUsage_UnsupportedProviderType(t *testing.T) {
-	auth := &coreauth.Auth{Provider: "claude", Metadata: map[string]any{"access_token": "t", "email": "c@x.com"}}
+	// gemini OAuth is a supported OAuth shape but has no usage adapter -> 422.
+	// (Claude is now a supported usage provider, so it no longer hits this path.)
+	auth := &coreauth.Auth{Provider: "gemini", Metadata: map[string]any{"access_token": "t", "email": "c@x.com"}}
 	m := newManager(t, auth)
 	svc := newService()
 	res := svc.Usage(context.Background(), nil, m, StableID(auth), false)
 	if res.HTTPStatus != 422 || res.Error.Code != CodeUsageUnsupported {
-		t.Fatalf("want 422/unsupported for claude, got %+v", res)
+		t.Fatalf("want 422/unsupported for gemini, got %+v", res)
 	}
 }
 
@@ -503,4 +505,308 @@ func TestUsage_MultipleAccountsResolveIndependently(t *testing.T) {
 	if hitsA != 1 || hitsB != 1 {
 		t.Fatalf("each account must hit its own upstream once, got %d/%d", hitsA, hitsB)
 	}
+}
+
+// ---- Claude (Anthropic) adapter ----
+
+// claudeOAuthAuth builds a Claude OAuth credential pointing at an upstream mock
+// via the base_url attribute. No account_id is persisted (Claude falls back to
+// the email-derived stable id, which is the existing contract).
+func claudeOAuthAuth(serverURL string) *coreauth.Auth {
+	return &coreauth.Auth{
+		Provider:   "claude",
+		Attributes: map[string]string{"base_url": serverURL},
+		Metadata: map[string]any{
+			"access_token": "claude-test-token",
+			"email":        "claude@example.com",
+			"expired":      fixedNow.Add(24 * time.Hour).Format(time.RFC3339),
+		},
+	}
+}
+
+const sampleClaudeUsageBody = `{
+  "five_hour": {"utilization": 0.25, "resets_at": "2026-07-13T05:00:00Z"},
+  "seven_day": {"utilization": 0.0, "resets_at": "2026-07-20T00:00:00Z"},
+  "seven_day_opus": {"utilization": 0.5, "resets_at": "2026-07-20T00:00:00Z"},
+  "iguana_necktie": {"utilization": 0.1, "resets_at": "2026-07-20T00:00:00Z"},
+  "extra_usage": {"is_enabled": true, "monthly_limit": 100, "used_credits": 25, "utilization": 0.25}
+}`
+
+const sampleClaudeProfileBody = `{
+  "account": {"uuid": "acc-1", "display_name": "Claude User", "email": "claude@example.com", "has_claude_max": true, "has_claude_pro": false},
+  "organization": {"uuid": "org-1", "name": "Personal", "rate_limit_tier": "tier_5"}
+}`
+
+// claudeUpstreamServer returns a mock that serves /api/oauth/usage and
+// /api/oauth/profile. When requireHeaders is set it asserts the bearer token and
+// anthropic-beta header are present on every request.
+func claudeUpstreamServer(t *testing.T, usageBody, profileBody string, hits *int32, requireHeaders bool, usageStatus int) *httptest.Server {
+	t.Helper()
+	if usageStatus == 0 {
+		usageStatus = 200
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits != nil {
+			atomic.AddInt32(hits, 1)
+		}
+		if requireHeaders {
+			if got := r.Header.Get("Authorization"); got != "Bearer claude-test-token" {
+				t.Errorf("Authorization = %q, want Bearer claude-test-token", got)
+			}
+			if got := r.Header.Get("anthropic-beta"); got != "oauth-2025-04-20" {
+				t.Errorf("anthropic-beta = %q, want oauth-2025-04-20", got)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/api/oauth/usage"):
+			w.WriteHeader(usageStatus)
+			_, _ = io.WriteString(w, usageBody)
+		case strings.HasSuffix(r.URL.Path, "/api/oauth/profile"):
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, profileBody)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+}
+
+func meterByID(meters []Meter, id string) (Meter, bool) {
+	for _, m := range meters {
+		if m.ID == id {
+			return m, true
+		}
+	}
+	return Meter{}, false
+}
+
+func TestList_ClaudeUsageSupported(t *testing.T) {
+	auth := claudeOAuthAuth("")
+	m := newManager(t, auth)
+	svc := newService()
+	list := svc.List(m)
+
+	var claude *Provider
+	for i := range list.Providers {
+		if list.Providers[i].Type == "claude" {
+			claude = &list.Providers[i]
+		}
+	}
+	if claude == nil {
+		t.Fatalf("claude provider not listed: %+v", list.Providers)
+	}
+	if !claude.UsageSupported {
+		t.Fatalf("claude oauth must be usageSupported")
+	}
+	if !strings.HasPrefix(claude.ID, "claude:account_") {
+		t.Fatalf("claude id = %q, want claude:account_ prefix", claude.ID)
+	}
+}
+
+func TestClaudeUsage_Normalization(t *testing.T) {
+	var hits int32
+	srv := claudeUpstreamServer(t, sampleClaudeUsageBody, sampleClaudeProfileBody, &hits, true, 200)
+	defer srv.Close()
+
+	auth := claudeOAuthAuth(srv.URL)
+	m := newManager(t, auth)
+	id := StableID(auth)
+
+	svc := newService()
+	res := svc.Usage(context.Background(), nil, m, id, false)
+	if res.HTTPStatus != 200 || res.Error != nil {
+		t.Fatalf("status=%d err=%+v", res.HTTPStatus, res.Error)
+	}
+	u := res.Usage
+	if u.Provider.ID != id || u.RawProviderType != "claude" {
+		t.Fatalf("provider = %+v", u.Provider)
+	}
+
+	// five_hour utilization 0.25 -> used 25, remaining 75.
+	five, ok := meterByID(u.Meters, "five_hour")
+	if !ok {
+		t.Fatalf("missing five_hour meter: %+v", u.Meters)
+	}
+	if five.Used == nil || *five.Used != 25 {
+		t.Fatalf("five_hour used = %v want 25", five.Used)
+	}
+	if five.Remaining == nil || *five.Remaining != 75 {
+		t.Fatalf("five_hour remaining = %v want 75", five.Remaining)
+	}
+	if five.Limit == nil || *five.Limit != 100 || five.Window != "5h" || five.Unit != "%" {
+		t.Fatalf("five_hour meta wrong: %+v", five)
+	}
+	if five.ResetAt == nil || five.UnknownReset {
+		t.Fatalf("five_hour resetAt missing")
+	}
+
+	// seven_day utilization 0.0 -> used 0, remaining 100.
+	seven, ok := meterByID(u.Meters, "seven_day")
+	if !ok {
+		t.Fatalf("missing seven_day meter")
+	}
+	if seven.Used == nil || *seven.Used != 0 {
+		t.Fatalf("seven_day used = %v want 0", seven.Used)
+	}
+	if seven.Remaining == nil || *seven.Remaining != 100 {
+		t.Fatalf("seven_day remaining = %v want 100", seven.Remaining)
+	}
+
+	// A scoped weekly window is preserved.
+	opus, ok := meterByID(u.Meters, "seven_day_opus")
+	if !ok || opus.Used == nil || *opus.Used != 50 {
+		t.Fatalf("seven_day_opus scoped meter wrong: %+v", opus)
+	}
+
+	// Plan derived from profile, extra-usage credits meter preserved.
+	if !strings.Contains(u.Message, "plan: max") {
+		t.Fatalf("message = %q", u.Message)
+	}
+	extra, ok := meterByID(u.Meters, "extra_usage")
+	if !ok || extra.Used == nil || *extra.Used != 25 || extra.Limit == nil || *extra.Limit != 100 {
+		t.Fatalf("extra_usage meter wrong: %+v", extra)
+	}
+
+	// Convenience fields: balance <- five-hour, subscription <- seven-day.
+	if u.Balance == nil || *u.Balance.Remaining != 75 {
+		t.Fatalf("balance wrong: %+v", u.Balance)
+	}
+	if u.Subscription == nil || *u.Subscription.Remaining != 100 {
+		t.Fatalf("subscription wrong: %+v", u.Subscription)
+	}
+	if !u.FetchedAt.Equal(fixedNow) {
+		t.Fatalf("fetchedAt = %v want %v", u.FetchedAt, fixedNow)
+	}
+}
+
+func TestClaudeUsage_ZeroUtilizationFullRemaining(t *testing.T) {
+	body := `{
+	  "five_hour": {"utilization": 0.0, "resets_at": "2026-07-13T05:00:00Z"},
+	  "seven_day": {"utilization": 0.0, "resets_at": "2026-07-20T00:00:00Z"}
+	}`
+	srv := claudeUpstreamServer(t, body, sampleClaudeProfileBody, nil, false, 200)
+	defer srv.Close()
+
+	auth := claudeOAuthAuth(srv.URL)
+	m := newManager(t, auth)
+	svc := newService()
+	res := svc.Usage(context.Background(), nil, m, StableID(auth), false)
+	if res.HTTPStatus != 200 || res.Usage == nil {
+		t.Fatalf("expected 200, got %+v", res)
+	}
+	for _, id := range []string{"five_hour", "seven_day"} {
+		meter, ok := meterByID(res.Usage.Meters, id)
+		if !ok {
+			t.Fatalf("missing %s meter", id)
+		}
+		if meter.Used == nil || *meter.Used != 0 {
+			t.Fatalf("%s used = %v want 0", id, meter.Used)
+		}
+		if meter.Remaining == nil || *meter.Remaining != 100 {
+			t.Fatalf("%s remaining = %v want 100 at zero utilization", id, meter.Remaining)
+		}
+	}
+}
+
+func TestClaudeUsage_FableScopedLimit(t *testing.T) {
+	// A "limits" array with a scoped weekly limit per model (Fable). The percent
+	// is already on a 0-100 scale and must NOT be multiplied. The identity rides
+	// in the "type" field (Claude limit objects are not documented to use "name")
+	// and the reset uses the "resets_at" spelling like the rolling windows. The
+	// second limit echoes the seven_day window (same value + reset) and must be
+	// dropped as a redundant duplicate.
+	body := `{
+	  "five_hour": {"utilization": 0.0, "resets_at": "2026-07-13T05:00:00Z"},
+	  "seven_day": {"utilization": 0.0, "resets_at": "2026-07-20T00:00:00Z"},
+	  "limits": [
+	    {"type": "weekly_scoped", "model": "claude-fable-5", "percent": 30, "resets_at": "2026-07-20T00:00:00Z"},
+	    {"type": "weekly", "percent": 0, "resets_at": "2026-07-20T00:00:00Z"}
+	  ]
+	}`
+	srv := claudeUpstreamServer(t, body, sampleClaudeProfileBody, nil, false, 200)
+	defer srv.Close()
+
+	auth := claudeOAuthAuth(srv.URL)
+	mm := newManager(t, auth)
+	svc := newService()
+	res := svc.Usage(context.Background(), nil, mm, StableID(auth), false)
+	if res.HTTPStatus != 200 || res.Usage == nil {
+		t.Fatalf("expected 200, got %+v", res)
+	}
+
+	// five_hour + seven_day + the Fable scoped limit; the redundant weekly echo
+	// is dropped.
+	if len(res.Usage.Meters) != 3 {
+		t.Fatalf("expected 3 meters after dedup, got %d: %+v", len(res.Usage.Meters), res.Usage.Meters)
+	}
+	var fable *Meter
+	for i := range res.Usage.Meters {
+		if strings.Contains(strings.ToLower(res.Usage.Meters[i].Label), "fable") {
+			fable = &res.Usage.Meters[i]
+		}
+	}
+	if fable == nil {
+		t.Fatalf("expected a fable scoped meter, got %+v", res.Usage.Meters)
+	}
+	// percent 30 -> used 30, remaining 70 (NOT 3000 / 70).
+	if fable.Used == nil || *fable.Used != 30 {
+		t.Fatalf("fable used = %v want 30", fable.Used)
+	}
+	if fable.Remaining == nil || *fable.Remaining != 70 {
+		t.Fatalf("fable remaining = %v want 70", fable.Remaining)
+	}
+	if fable.Limit == nil || *fable.Limit != 100 || fable.Window != "weekly" {
+		t.Fatalf("fable meta wrong: %+v", fable)
+	}
+	if fable.ResetAt == nil || fable.UnknownReset {
+		t.Fatalf("fable resets_at not parsed: %+v", fable)
+	}
+}
+
+func TestClaudeUsage_UpstreamAuthFailure(t *testing.T) {
+	srv := claudeUpstreamServer(t, `{"error":"unauthorized"}`, sampleClaudeProfileBody, nil, false, 401)
+	defer srv.Close()
+
+	auth := claudeOAuthAuth(srv.URL)
+	m := newManager(t, auth)
+	svc := newService()
+	res := svc.Usage(context.Background(), nil, m, StableID(auth), false)
+	// 401 upstream -> 403 USAGE_UNAUTHORIZED (NOT usageSupported false / 422).
+	if res.HTTPStatus != 403 || res.Error == nil || res.Error.Code != CodeCredentialUnauthorized {
+		t.Fatalf("want 403/USAGE_UNAUTHORIZED for upstream 401, got %+v", res)
+	}
+}
+
+func TestClaudeUsage_NoTokenLeakage(t *testing.T) {
+	srv := claudeUpstreamServer(t, sampleClaudeUsageBody, sampleClaudeProfileBody, nil, false, 200)
+	defer srv.Close()
+
+	auth := claudeOAuthAuth(srv.URL)
+	m := newManager(t, auth)
+	svc := newService()
+	res := svc.Usage(context.Background(), nil, m, StableID(auth), false)
+	if res.Usage == nil {
+		t.Fatalf("expected usage")
+	}
+	out := string(jsonMustMarshal(t, res.Usage))
+	if strings.Contains(out, "claude-test-token") {
+		t.Fatalf("response leaks access token: %s", out)
+	}
+	// Profile is fetched but only the plan label is extracted; the full email /
+	// display name from the profile must not be echoed.
+	if strings.Contains(out, "claude@example.com") {
+		t.Fatalf("response leaks full email: %s", out)
+	}
+	if !strings.Contains(out, "c***@example.com") {
+		t.Fatalf("expected masked email in displayName: %s", out)
+	}
+}
+
+func jsonMustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
 }

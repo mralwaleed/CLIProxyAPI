@@ -134,9 +134,11 @@ func DisplayName(auth *coreauth.Auth) string {
 }
 
 // UsageSupported reports whether upstream usage can be fetched for this
-// credential. Today only OAuth Codex/ChatGPT accounts are supported (they have
-// a persisted account id and a known quota endpoint). API-key accounts and
-// other OAuth providers report unsupported; their usage endpoint returns 422.
+// credential. Today OAuth Codex/ChatGPT and Claude/Anthropic accounts are
+// supported (each has a known quota endpoint). API-key accounts and other OAuth
+// providers report unsupported; their usage endpoint returns 422. An expired or
+// revoked token is NOT reported as unsupported here — the static listing keeps
+// usageSupported true and the per-request fetch surfaces the auth failure.
 func UsageSupported(auth *coreauth.Auth) bool {
 	if auth == nil {
 		return false
@@ -146,7 +148,7 @@ func UsageSupported(auth *coreauth.Auth) bool {
 		return false
 	}
 	switch ProviderType(auth) {
-	case "codex":
+	case "codex", "claude":
 		return true
 	}
 	return false
